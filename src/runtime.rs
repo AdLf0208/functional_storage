@@ -131,7 +131,6 @@ impl Drawer {
     }
 
     /// Takes up to `count` out of `slot`; returns how many were taken.
-    #[allow(dead_code)]
     pub fn extract(&mut self, slot: usize, count: u32, max_stack: u32) -> u32 {
         let limit = self.limit(slot, max_stack);
         let Some(big) = self.slots.get_mut(slot) else {
@@ -139,7 +138,7 @@ impl Drawer {
         };
         let taken = big.amount.min(count).min(limit);
         big.amount -= taken;
-        if big.amount == 0 {
+        if big.amount == 0 && !self.locked {
             big.item = None;
         }
         taken
@@ -192,7 +191,7 @@ impl Drawer {
             }
             (Some(_held), None) => {
                 big.amount = big.amount.saturating_sub(view);
-                if big.amount == 0 {
+                if big.amount == 0 && !locked {
                     big.item = None;
                 }
             }
@@ -200,7 +199,7 @@ impl Drawer {
                 if key == held {
                     let adjusted = big.amount as i64 - i64::from(view) + i64::from(count);
                     big.amount = adjusted.clamp(0, i64::from(limit)) as u32;
-                    if big.amount == 0 {
+                    if big.amount == 0 && !locked {
                         big.item = None;
                     }
                 } else {
@@ -210,7 +209,9 @@ impl Drawer {
                     // back.
                     big.amount = big.amount.saturating_sub(view);
                     if big.amount == 0 {
-                        big.item = None;
+                        if !locked {
+                            big.item = None;
+                        }
                         return Sync {
                             rejected: Some((key.to_owned(), count)),
                             changed: before != 0,
@@ -321,6 +322,46 @@ mod tests {
         assert_eq!(d.amount(0), 0);
         assert_eq!(d.item(0), None);
         assert_eq!(d.extract(0, 1, 64), 0);
+    }
+
+    #[test]
+    fn a_locked_drawer_keeps_its_kind_when_it_is_emptied() {
+        // Upstream `BigInventoryHandler.extractItem` clears the stored stack only when the drawer is
+        // unlocked (`if (!isLocked()) bigStack.setStack(EMPTY)`), so a locked drawer still shows its
+        // item at zero and still refuses another kind.
+        let mut d = drawer();
+        d.insert(0, "minecraft:stone", 3, 64);
+        d.toggle_locked();
+        assert_eq!(d.extract(0, 8, 64), 3);
+        assert_eq!(d.amount(0), 0);
+        assert_eq!(
+            d.item(0),
+            Some("minecraft:stone"),
+            "a locked drawer keeps its kind"
+        );
+        assert_eq!(
+            d.insert(0, "minecraft:dirt", 1, 64),
+            0,
+            "another kind is still refused"
+        );
+        assert_eq!(
+            d.insert(0, "minecraft:stone", 5, 64),
+            5,
+            "its own kind comes back"
+        );
+    }
+
+    #[test]
+    fn a_locked_drawer_keeps_its_kind_when_the_view_empties_it() {
+        // The container path (a hopper or the menu taking the last item) applies the same rule.
+        let mut d = drawer();
+        d.insert(0, "minecraft:stone", 1, 64);
+        d.toggle_locked();
+        let sync = d.sync_view(0, None, 64);
+        assert!(sync.changed);
+        assert_eq!(sync.rejected, None);
+        assert_eq!(d.amount(0), 0);
+        assert_eq!(d.item(0), Some("minecraft:stone"));
     }
 
     #[test]

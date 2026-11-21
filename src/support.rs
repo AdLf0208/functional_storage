@@ -33,7 +33,7 @@ use mod_api::{
     ScreenEvent, ServerHost, ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Tag, Text,
 };
 
-use crate::runtime::{Drawer, capacity};
+use crate::runtime::{Drawer, Sync, capacity};
 
 /// The menu type the carried content declares (`data/functionalstorage/horizon/menu/drawer.json`).
 pub const DRAWER_MENU: &str = "functionalstorage:drawer";
@@ -52,6 +52,8 @@ const STASH_LIFETIME: Duration = Duration::from_secs(2);
 const SIGNAL_LIFETIME: u64 = 200;
 /// Upstream's double-click window for the whole-inventory sweep.
 const SWEEP_WINDOW: Duration = Duration::from_millis(300);
+/// Upstream's `removeTicks`: a left click on a drawer's front is handled once every three ticks.
+const TAKE_COOLDOWN_TICKS: u64 = 3;
 
 /// The ten drawers' paths (the block entity type's `blocks` list), without the namespace.
 const DRAWER_PATHS: &[&str] = &[
@@ -94,6 +96,9 @@ pub struct Core {
     tick: u64,
     /// The last whole-inventory insert attempt of each player (300 ms).
     last_click: HashMap<u128, Instant>,
+    /// The tick each drawer was last left-clicked at, by `(dimension, pos)` (upstream's
+    /// `removeTicks`).
+    take: HashMap<(String, [i32; 3]), u64>,
 }
 
 static STATE: Mutex<Option<Core>> = Mutex::new(None);
@@ -157,8 +162,12 @@ pub fn declare_component(types: &mut Vec<String>) {
 }
 
 /// `/functionalstorage info <pos>`: the readout the in-game check asserts on.
+///
+/// It is an **operator's** command: any position the server has loaded can be named, and the answer
+/// names a drawer's stored item and amount, so a normal player has no business reading another
+/// machine's contents through chat.
 pub fn declare_commands(commands: &mut Vec<Command>) {
-    commands.push(Command::new("functionalstorage info <pos:block_pos>"));
+    commands.push(Command::op("functionalstorage info <pos:block_pos>", 2));
 }
 
 /// The item component a broken drawer's contents ride: the drawer's own saved compound
@@ -249,14 +258,19 @@ impl BlockEntityPart for DrawerPart {
         tick(host, event);
     }
 
-    /// What clients get of a drawer: the stored stack, for the front renderer.
+    /// What clients get of a drawer: the item id and one item, for the front renderer.
+    ///
+    /// The saved stack carries every component it was stored with — written book pages, shulker
+    /// contents, potion data — and a chunk-update tag goes to **every** viewer of the chunk, so
+    /// sending the saved stack whole disclosed them without opening the drawer. Only the fields the
+    /// model needs ride; the rest stays on the server.
     fn block_entity_update_tag(
         &self,
         event: &mut BlockEntityUpdateTagEvent<'_>,
     ) -> Option<Compound> {
         let mut out = Compound::new();
-        if let Some(item) = tag(&event.entity.nbt, KEY_ITEM) {
-            out.insert(KEY_ITEM.into(), item.clone());
+        if let Some(item) = render_item(&event.entity.nbt) {
+            out.insert(KEY_ITEM.into(), Tag::Compound(item));
         }
         Some(out)
     }
@@ -316,7 +330,8 @@ fn max_stack_of(host: &dyn Host, stack: &ItemStack) -> u32 {
     host.max_stack_size(stack.item()).unwrap_or(64).max(1)
 }
 
-/// A drawer read from its saved compound, with the stack it stores.
+/// A drawer read from its saved compound, with the stack it stores. A kind that stands at zero is
+/// still a kind: a locked drawer keeps it after the last item leaves.
 fn read_drawer(host: &dyn Host, nbt: &Compound) -> (Drawer, Option<ItemStack>) {
     let mut drawer = Drawer::new(1);
     drawer.locked = matches!(tag(nbt, KEY_LOCKED), Some(Tag::Byte(1)));
@@ -329,10 +344,9 @@ fn read_drawer(host: &dyn Host, nbt: &Compound) -> (Drawer, Option<ItemStack>) {
             Some(Tag::Int(n)) if *n > 0 => *n as u32,
             _ => 0,
         };
-        if amount > 0
-            && let Some(slot) = drawer.slots.first_mut()
-        {
-            slot.item = Some(stack_key(host, stack));
+        let key = stack_key(host, stack);
+        if let Some(slot) = drawer.slots.first_mut() {
+            slot.item = Some(key);
             slot.amount = amount;
         }
     }
@@ -340,7 +354,8 @@ fn read_drawer(host: &dyn Host, nbt: &Compound) -> (Drawer, Option<ItemStack>) {
 }
 
 /// Writes a drawer's state into its saved compound: the stored stack at count one, the true
-/// amount, the lock and the slot's limit. An emptied drawer drops the item and amount keys.
+/// amount, the lock and the slot's limit. An emptied **unlocked** drawer drops the item and amount
+/// keys; a locked one keeps its kind (at amount 0), as upstream's `extractItem` does.
 fn write_drawer(
     host: &dyn Host,
     nbt: &mut Compound,
@@ -348,7 +363,7 @@ fn write_drawer(
     stored: Option<&ItemStack>,
     limit: u32,
 ) {
-    match (stored, drawer.amount(0) > 0) {
+    match (stored, drawer.item(0).is_some()) {
         (Some(stack), true) => {
             let mut one = stack.clone();
             let _ = one.set_count(1);
@@ -384,6 +399,53 @@ fn drawer_data(nbt: &Compound) -> Compound {
         }
     }
     out
+}
+
+/// What a client needs to draw a drawer's stored item: its id, at count one, and nothing else.
+///
+/// The saved stack is the whole item — components included — and the chunk-update tag reaches every
+/// player who can see the chunk; a written book's pages or a shulker's contents must not. The
+/// renderer draws the item model, so the id is the field it cannot do without.
+fn render_item(nbt: &Compound) -> Option<Compound> {
+    let Some(Tag::Compound(item)) = tag(nbt, KEY_ITEM) else {
+        return None;
+    };
+    let mut out = Compound::new();
+    out.insert("id".into(), item.get(&"id".into())?.clone());
+    out.insert("count".into(), Tag::Int(1));
+    Some(out)
+}
+
+/// Brings `drawer` up to date with what the container slot holds **now**, and answers the stack the
+/// slot holds when the drawer must hand it back (a kind it does not keep).
+///
+/// The block-entity tick reconciles the slot once a tick, but a menu click or a hopper can take from
+/// it between two ticks. A write-back or a break that started from the saved amount alone would
+/// restore that take, and a break would pack it into the drop a second time, so both go through
+/// here first: [`reconcile`] is the one rule the tick, a click and a break all apply.
+fn settle(
+    host: &dyn Host,
+    entity: BlockEntityRef,
+    drawer: &mut Drawer,
+    max_stack: u32,
+) -> Option<ItemStack> {
+    let slot = entity.item_slot(host, 0).ok().flatten();
+    let observed = slot
+        .as_ref()
+        .map(|stack| (stack_key(host, stack), stack.count()));
+    let sync = reconcile(
+        drawer,
+        observed.as_ref().map(|(key, count)| (key.as_str(), *count)),
+        max_stack,
+    );
+    sync.rejected.and(slot)
+}
+
+/// The reconciliation rule: the drawer's true amount against what its view slot holds now (`slot` is
+/// the stack in it, or `None` when it is empty). A take lowers the amount by the view the drawer last
+/// wrote, a matching insert raises it by the difference, and another kind is handed back.
+fn reconcile(drawer: &mut Drawer, slot: Option<(&str, u32)>, max_stack: u32) -> Sync {
+    drawer.sync_view(0, slot, max_stack)
 }
 
 /// The stack the container slot shows for `drawer`: `view_count` of the stored stack, components
@@ -425,6 +487,9 @@ fn read_state(host: &dyn ServerHost, pos: [i32; 3]) -> Option<(Drawer, Option<It
 
 /// Reads the drawer at `pos` and applies `change`; writes it back. `change` returns a new stored
 /// stack when the drawer adopted one.
+///
+/// The drawer is reconciled with the view slot **before** `change` runs: a menu or a hopper take the
+/// tick has not seen yet must not be restored by this write-back.
 fn mutate(
     host: &mut dyn ServerHost,
     pos: [i32; 3],
@@ -440,6 +505,10 @@ fn mutate(
         return false;
     };
     let (mut drawer, stored) = read_drawer(&*host, &nbt);
+    let max_stack = stored
+        .as_ref()
+        .map_or(64, |stack| max_stack_of(&*host, stack));
+    let rejected = settle(&*host, entity, &mut drawer, max_stack);
     let new_stored = change(&mut drawer, stored.as_ref()).or_else(|| {
         if drawer.item(0).is_some() {
             stored.clone()
@@ -448,6 +517,10 @@ fn mutate(
         }
     });
     write_entity(host, entity, &drawer, new_stored.as_ref());
+    // A stack of another kind in the view is handed back rather than overwritten by our own view.
+    if let Some(stack) = rejected {
+        eject(host, level, pos, stack);
+    }
     true
 }
 
@@ -725,11 +798,11 @@ pub fn right_click(host: HostSide<'_>, event: &mut mod_api::RightClickBlockEvent
         let _ = player.action_bar(server, Text::literal("The drawer holds another item"));
         return Flow::Cancel;
     }
-    let mut left = held;
-    let _ = left.set_count(left.count() - inserted);
-    let hand = (left.count() > 0).then_some(left);
-    if let Some(living) = server.living(player.entity()) {
-        let _ = living.set_hand_item(server, click.hand, hand);
+    // What the hand keeps, and the write that takes the stored part out of it. `set_inventory_slot`
+    // writes the selected slot as `/item replace` does and sends it with the tick's inventory sync.
+    let hand = remaining(&held, inserted);
+    if let Some(slot) = player.selected_slot(&*server) {
+        let _ = player.set_inventory_slot(server, slot as u32, hand);
     }
     // Upstream's double-click window: a second click within 300 ms fills the drawer from the whole
     // inventory.
@@ -757,9 +830,13 @@ pub fn right_click(host: HostSide<'_>, event: &mut mod_api::RightClickBlockEvent
     Flow::Cancel
 }
 
-/// A left click on the drawer's front. The pack keeps a block-entity write only from an
-/// authoritative player action, and the 0.1.0 in-game run showed this hook's write reverted, so a
-/// take here would duplicate: the click only shows the withdraw hint and the dig goes on.
+/// A left click on a drawer's front panel: upstream's take — one item, or the stored item's whole
+/// stack while sneaking — handed to the player, and the dig cancelled so the front panel is never
+/// mined. A click on any other face digs the drawer as usual.
+///
+/// Upstream `ItemControllableDrawerTile.onClicked` runs the take on the server only, only when the
+/// ray hits the front face, and at most once every three ticks (`removeTicks`). It clears the stored
+/// stack only when the drawer is unlocked, so a locked drawer keeps its kind at zero.
 pub fn left_click(host: &mut dyn ServerHost, event: &mut mod_api::LeftClickBlockEvent) -> Flow {
     if event.cancelled {
         return Flow::Continue;
@@ -791,10 +868,93 @@ pub fn left_click(host: &mut dyn ServerHost, event: &mut mod_api::LeftClickBlock
     if facing_offset(&facing) != event.face {
         return Flow::Continue;
     }
-    if let Some(player) = host.players().acting_player() {
-        let _ = player.action_bar(host, Text::literal("Open the drawer to withdraw"));
+    // From here on the click is on the front panel: the dig is cancelled (upstream's handler cancels
+    // it whenever the ray hits the panel), and the tick window decides the take.
+    let dimension = host.dimension().to_owned();
+    let now = core().as_ref().map_or(0, |state| state.tick);
+    let last = {
+        let guard = core();
+        guard
+            .as_ref()
+            .and_then(|state| state.take.get(&(dimension.clone(), pos)).copied())
+    };
+    if !take_ready(last, now) {
+        return Flow::Cancel;
     }
-    Flow::Continue
+    {
+        let mut guard = core();
+        let state = guard.get_or_insert_with(Core::default);
+        state.take.insert((dimension.clone(), pos), now);
+    }
+    let Some((_, stored)) = read_state(&*host, pos) else {
+        return Flow::Cancel;
+    };
+    let Some(stored) = stored else {
+        return Flow::Cancel;
+    };
+    let Some(player) = host.players().acting_player() else {
+        return Flow::Cancel;
+    };
+    let max_stack = max_stack_of(&*host, &stored);
+    let sneaking = player.is_secondary_use_active(&*host).unwrap_or(false);
+    let want = take_count(sneaking, max_stack);
+    let mut taken = 0;
+    let changed = mutate(host, pos, |drawer, _| {
+        taken = drawer.extract(0, want, max_stack);
+        None
+    });
+    if !changed || taken == 0 {
+        return Flow::Cancel;
+    }
+    // The take is the stored stack (its components included) at the count that left the drawer.
+    let mut give = stored;
+    if give.set_count(taken).is_err() {
+        return Flow::Cancel;
+    }
+    // `PlayerRef::give_stack` is the API's `ItemHandlerHelper.giveItemToPlayer`: `Inventory.add`
+    // fills matching stacks, then empty slots, and throws what does not fit from the player's eyes.
+    // A refused give (a dead or stale player) drops the take at the drawer instead of destroying it.
+    if player.give_stack(host, give.clone()).is_err() {
+        eject(host, level, pos, give);
+    }
+    Flow::Cancel
+}
+
+/// How many items a left click takes: one, or the item's whole stack while sneaking
+/// (`ItemControllableDrawerTile.onClicked`: `isShiftKeyDown() ? stackInSlot(slot).getMaxStackSize() : 1`).
+fn take_count(sneaking: bool, max_stack: u32) -> u32 {
+    if sneaking { max_stack.max(1) } else { 1 }
+}
+
+/// Whether a drawer may be clicked again: upstream's `removeTicks` is set to 3 on a click and
+/// counted down by the tile's tick, so two takes are at least [`TAKE_COOLDOWN_TICKS`] apart.
+fn take_ready(last: Option<u64>, now: u64) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.wrapping_sub(last) >= TAKE_COOLDOWN_TICKS,
+    }
+}
+
+/// What is left of `stack` after `taken` of it left: `None` when nothing is left.
+///
+/// `ItemStack::set_count(0)` is **refused** at this pin, so `stack.set_count(count - taken)` leaves an
+/// emptied stack at its old count: the drawer stored the stack and the hand kept it, an item
+/// duplication the 0.2.1 in-game leg caught (the server still held the 64 stone after the click). An
+/// emptied hand is `None`, never a zero-count copy.
+fn remaining(stack: &ItemStack, taken: u32) -> Option<ItemStack> {
+    let left = kept_count(stack.count(), taken)?;
+    let mut rest = stack.clone();
+    rest.set_count(left).ok()?;
+    Some(rest)
+}
+
+/// The count a stack keeps after `taken` of its `have` left: `None` when nothing is left.
+///
+/// An emptied stack is `None`, never a zero-count copy: `set_count(0)` is refused, so a "keep the
+/// rest" written as `stack.set_count(count - taken)` silently keeps the whole stack.
+fn kept_count(have: u32, taken: u32) -> Option<u32> {
+    let left = have.saturating_sub(taken);
+    (left > 0).then_some(left)
 }
 
 /// Inserts every matching stack of the acting player's inventory (upstream's 300 ms second click).
@@ -828,10 +988,7 @@ fn sweep_inventory(host: &mut dyn ServerHost, pos: [i32; 3]) {
         if take == 0 {
             break;
         }
-        let mut left = stack;
-        let _ = left.set_count(left.count() - take);
-        let hand = (left.count() > 0).then_some(left);
-        let _ = player.set_inventory_slot(host, slot, hand);
+        let _ = player.set_inventory_slot(host, slot, remaining(&stack, take));
     }
 }
 
@@ -871,6 +1028,10 @@ pub fn explosion_detonate(
 }
 
 /// Stashes the part of a drawer's contents the container does not spill: `amount − view`.
+///
+/// The drawer is reconciled with the view slot first, like a click's write-back: a take the tick has
+/// not seen yet has already left the slot, and packing the saved amount into the drop would hand the
+/// withdrawal out a second time.
 fn stash_bulk(host: &mut dyn ServerHost, dimension: &str, pos: [i32; 3]) {
     let Some(level) = host.level(dimension) else {
         return;
@@ -884,17 +1045,18 @@ fn stash_bulk(host: &mut dyn ServerHost, dimension: &str, pos: [i32; 3]) {
     if tag(&nbt, KEY_ITEM).is_none() {
         return;
     }
+    let (mut drawer, stored) = read_drawer(&*host, &nbt);
+    let max_stack = stored
+        .as_ref()
+        .map_or(64, |stack| max_stack_of(&*host, stack));
+    let _ = settle(&*host, entity, &mut drawer, max_stack);
     let view = entity
         .item_slot(&*host, 0)
         .ok()
         .flatten()
         .map_or(0, |stack| stack.count());
-    let amount = match tag(&nbt, KEY_AMOUNT) {
-        Some(Tag::Int(n)) if *n > 0 => *n as u32,
-        _ => 0,
-    };
-    let bulk = amount.saturating_sub(view);
-    if bulk == 0 {
+    let bulk = drawer.amount(0).saturating_sub(view);
+    if bulk == 0 && drawer.item(0).is_none() {
         return;
     }
     let mut data = drawer_data(&nbt);
@@ -1003,7 +1165,10 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
                 if drawer.locked { " locked" } else { "" }
             )
         }
-        None => format!("{}: not a drawer", block_id(host, pos)),
+        // Anything that is not one of our drawers gets the same generic answer: naming the block
+        // would let a caller probe for hidden blocks anywhere the server has it loaded, and the
+        // stored item and amount are a drawer's business only.
+        None => "Not a drawer.".to_owned(),
     };
     let _ = host.commands().feedback(Text::literal(line));
     Flow::Cancel
@@ -1202,5 +1367,138 @@ mod tests {
         let mut drawer = Drawer::new(1);
         drawer.insert(0, "minecraft:stone", 1024, 64);
         assert_eq!(view_stack(&drawer, None, 64), None);
+    }
+
+    #[test]
+    fn the_left_click_takes_one_or_a_whole_stack_while_sneaking() {
+        // `ItemControllableDrawerTile.onClicked`: 1, or the stored item's stack size while sneaking.
+        assert_eq!(take_count(false, 64), 1);
+        assert_eq!(take_count(true, 64), 64);
+        assert_eq!(take_count(true, 16), 16);
+        assert_eq!(take_count(true, 1), 1);
+    }
+
+    #[test]
+    fn the_left_click_window_is_three_ticks() {
+        assert!(take_ready(None, 100), "a drawer never clicked takes");
+        assert!(!take_ready(Some(100), 100));
+        assert!(!take_ready(Some(100), 102));
+        assert!(take_ready(Some(100), 103), "three ticks after the click");
+        assert!(take_ready(Some(100), 200));
+        assert!(
+            take_ready(Some(u64::MAX - 1), 1),
+            "a wrapped tick counter must not lock a drawer out"
+        );
+    }
+
+    #[test]
+    fn the_info_command_needs_an_operator() {
+        // The readout names a drawer's stored item and amount at any position the server has
+        // loaded, so it is an operator's command (the source review's `support.rs:1006` item).
+        let mut commands = Vec::new();
+        declare_commands(&mut commands);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].usage, "functionalstorage info <pos:block_pos>");
+        assert_eq!(
+            commands[0].level, 2,
+            "a machine's contents are a game master's readout, not every player's"
+        );
+    }
+
+    #[test]
+    fn a_writeback_after_a_withdraw_does_not_restore_the_withdrawn_count() {
+        // The source review's scenario: 1024 stone is a view of 32 in the slot. A menu takes the whole
+        // view, and the block-entity tick has not run yet, so the saved amount still says 1024.
+        let mut drawer = Drawer::new(1);
+        drawer.insert(0, "minecraft:stone", 1024, 64);
+        assert_eq!(drawer.view_count(0, 64), 32);
+        // A click's write-back goes through `reconcile` first (the fix); without it the amount below
+        // is still 1024 and the withdrawal is handed back.
+        let sync = reconcile(&mut drawer, None, 64);
+        assert!(sync.changed, "the take is accounted for");
+        assert_eq!(drawer.amount(0), 992, "1024 - the 32 that left the slot");
+        // The click's own stack (64) is what the drawer then stores.
+        assert_eq!(drawer.insert(0, "minecraft:stone", 64, 64), 64);
+        assert_eq!(drawer.amount(0), 1056, "992 + the 64 the player stored");
+    }
+
+    #[test]
+    fn a_matching_hopper_insert_is_accounted_for_before_the_writeback() {
+        // The other direction: a hopper put one into the view (31 -> 32) before the tick saw it.
+        let mut drawer = Drawer::new(1);
+        drawer.insert(0, "minecraft:stone", 1000, 64); // view = ceil(1000*64/2048) = 32
+        assert_eq!(drawer.view_count(0, 64), 32);
+        let _ = reconcile(&mut drawer, Some(("minecraft:stone", 33)), 64);
+        assert_eq!(drawer.amount(0), 1001);
+    }
+
+    #[test]
+    fn a_break_packs_only_what_the_slot_still_shows() {
+        // The break half of the finding: the drop carries `amount - view`, so the amount must be the
+        // reconciled one. The menu took the view (32) and the amount is still 1024 until a write-back
+        // or a break reconciles it; the bulk is then 992 - 0, not 1024 - 0.
+        let mut drawer = Drawer::new(1);
+        drawer.insert(0, "minecraft:stone", 1024, 64);
+        let _ = reconcile(&mut drawer, None, 64);
+        // The slot is empty, so the container's removal spills nothing and `stash_bulk` packs
+        // `amount - slot_count`.
+        let slot_count = 0;
+        assert_eq!(
+            drawer.amount(0).saturating_sub(slot_count),
+            992,
+            "the withdrawn 32 is not packed into the drop a second time"
+        );
+    }
+
+    #[test]
+    fn an_emptied_hand_is_none_not_a_zero_count_copy() {
+        // `set_count(0)` is refused at this pin, so `held.set_count(held.count() - inserted)` left an
+        // emptied hand holding the whole stack while the drawer had it: the source review's write-back
+        // item, caught by the in-game leg as an item duplication (64 stored, 64 still in the hand).
+        assert_eq!(kept_count(64, 64), None, "the emptied hand is empty");
+        assert_eq!(kept_count(64, 10), Some(54));
+        assert_eq!(
+            kept_count(64, 0),
+            Some(64),
+            "a click that stored nothing leaves the stack alone"
+        );
+        assert_eq!(
+            kept_count(64, 100),
+            None,
+            "more taken than there was leaves nothing, never a negative count"
+        );
+    }
+
+    #[test]
+    fn the_client_update_carries_only_what_the_front_draws() {
+        // A written book in a drawer: its pages are components of the saved stack, and the
+        // chunk-update tag reaches every viewer of the chunk.
+        let mut book = Compound::new();
+        book.insert("id".into(), Tag::String("minecraft:written_book".into()));
+        book.insert("count".into(), Tag::Int(1));
+        let mut components = Compound::new();
+        components.insert(
+            "minecraft:written_book_content".into(),
+            Tag::String("the pages".into()),
+        );
+        book.insert("components".into(), Tag::Compound(components));
+        let mut nbt = Compound::new();
+        nbt.insert(KEY_ITEM.into(), Tag::Compound(book));
+        nbt.insert(KEY_AMOUNT.into(), Tag::Int(16));
+
+        let sent = render_item(&nbt).expect("the front still gets an item");
+        assert_eq!(sent.len(), 2, "exactly `id` and `count` ride: {sent:?}");
+        assert_eq!(
+            sent.get(&"id".into()),
+            Some(&Tag::String("minecraft:written_book".into())),
+            "the model needs the item id"
+        );
+        assert_eq!(sent.get(&"count".into()), Some(&Tag::Int(1)));
+        assert!(
+            !sent.contains_key(&"components".into()),
+            "book pages (and any nested container) stay on the server"
+        );
+        // An empty drawer sends no item at all.
+        assert_eq!(render_item(&Compound::new()), None);
     }
 }

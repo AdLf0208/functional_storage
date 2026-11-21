@@ -85,9 +85,8 @@ impl Hooks for Mod {
         support::right_click(host, event)
     }
 
-    /// A left click on the front: upstream's take-one is refused at this pin (a block-entity write
-    /// from this hook is reverted, so the take would duplicate); the click only shows the withdraw
-    /// hint, and the menu's result slot is the withdrawal.
+    /// A left click on the drawer's front: upstream's take — one item, or a whole stack while
+    /// sneaking — handed to the player, with the dig cancelled; another face digs the drawer.
     fn left_click_block(&self, host: &mut dyn ServerHost, event: &mut LeftClickBlockEvent) -> Flow {
         support::left_click(host, event)
     }

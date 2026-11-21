@@ -10,9 +10,10 @@
 #      result slot withdraws one (the view is 2 at 64 stored, half of it is 1),
 #      which the block entity reconciles against the true amount (64 -> 63);
 #   5. a second stone click adds 5 more;
-#   6. in survival a left click shows the action-bar hint "Open the drawer to
-#      withdraw" and takes nothing: the pin reverts a block-entity write from
-#      `left_click_block`, so a real take would duplicate (notes.md);
+#   6. in survival a left click on the front takes one item, hands it over and
+#      cancels the dig; holding the dig on the front panel does not break it; a
+#      locked drawer's sneaking left click takes the whole stack and the drawer
+#      keeps its kind at zero (upstream's take);
 #   7. a hopper above pushes stone in and a hopper below pulls stone out into
 #      a chest (the container view is the same reconcile path);
 #   8. a comparator beside it answers 1 for a partial drawer and 0 when empty;
@@ -82,10 +83,9 @@ dropped_item() {
 block_name() { ctl block "$1" "$2" "$3" | jq -r '.block // "unknown"'; }
 block_state() { ctl block "$1" "$2" "$3" | jq -r '.state // "unknown"'; }
 block_facing() { block_state "$1" "$2" "$3" | sed -n 's/.*facing=\([a-z]*\).*/\1/p'; }
-# The reply names the block at that position, so it starts with the drawer's id
-# in the drawer phases and with another id ("minecraft:barrel: not a drawer")
-# in the counterfactual; do not filter to one namespace.
-info() { ctl chat "/functionalstorage info $1 $2 $3" >/dev/null; ctl wait 8 >/dev/null; ctl messages 8 | jq -r '.chat[]' | grep -m1 -E '^[a-z0-9_.-]+:[a-z0-9_./-]+:' || true; }
+# A drawer's reply starts with its own block id; anything that is not a drawer gets
+# the one generic line ("Not a drawer."), which names no block at all (0.2.1).
+info() { ctl chat "/functionalstorage info $1 $2 $3" >/dev/null; ctl wait 8 >/dev/null; ctl messages 8 | jq -r '.chat[]' | grep -m1 -E '^(Not a drawer\.|[a-z0-9_.-]+:[a-z0-9_./-]+:)' || true; }
 info_amount() { info "$1" "$2" "$3" | sed -n 's/.*: \([0-9][0-9]*\)\/[0-9][0-9]*.*/\1/p'; }
 # The action bar is in `messages` (agent.rs `messages_value`), not in `state`.
 action_bar() { ctl messages 10 | jq -r '.actionbar // ""'; }
@@ -140,7 +140,7 @@ PX=$(ctl state | jq -r '.player.position[0]' | cut -d. -f1)
 PZ=$(ctl state | jq -r '.player.position[2]' | cut -d. -f1)
 ctl command "fill $((PX-8)) 100 $((PZ-8)) $((PX+8)) 100 $((PZ+8)) minecraft:stone" >/dev/null
 ctl command "fill $((PX-8)) 101 $((PZ-8)) $((PX+8)) 110 $((PZ+8)) minecraft:air" >/dev/null
-ctl tp "$PX.5" 101 "$((PZ+3)).5" >/dev/null
+ctl command "tp @s $PX.5 101 $((PZ+3)).5" >/dev/null
 ctl wait 20
 ctl command "gamerule spawn_mobs false" >/dev/null
 ctl command "gamerule spawn_monsters false" >/dev/null
@@ -179,7 +179,7 @@ ctl wait 6
 
 if [ "$COUNTERFACTUAL" = 1 ]; then
     say "counterfactual: the vanilla barrel is not a drawer"
-    info "$X" "$Y" "$Z" | grep -q 'not a drawer' || fail "the barrel answered as a drawer: $(info "$X" "$Y" "$Z")"
+    info "$X" "$Y" "$Z" | grep -q '^Not a drawer\.$' || fail "the barrel answered as a drawer: $(info "$X" "$Y" "$Z")"
     ctl command "clear @s" >/dev/null
     ctl give minecraft:stone 100 >/dev/null
     ctl wait 4
@@ -198,6 +198,56 @@ say "empty drawer readout"
 line=$(info "$X" "$Y" "$Z")
 echo "readout: $line"
 echo "$line" | grep -q '^functionalstorage:oak_1: 0/2048 empty$' || fail "unexpected empty readout: $line"
+
+say "a block that is not a drawer gets one generic answer, naming nothing (0.2.1)"
+# The source review's `support.rs:1006`: the readout used to name the block at any position (and was
+# open to every player). It is an operator command now, and a non-drawer gets the same line.
+NX=$((X + 2))
+ctl command "setblock $NX $((Y - 1)) $Z minecraft:stone" >/dev/null
+ctl command "setblock $NX $Y $Z minecraft:barrel" >/dev/null
+ctl wait 4 >/dev/null
+[ "$(block_name "$NX" "$Y" "$Z")" = "minecraft:barrel" ] || fail "the control barrel was not placed"
+not_drawer=$(info "$NX" "$Y" "$Z")
+echo "readout at the barrel: '$not_drawer'"
+[ "$not_drawer" = "Not a drawer." ] || fail "a non-drawer block answered '$not_drawer', expected the generic 'Not a drawer.'"
+case "$not_drawer" in
+    *barrel*|*minecraft:*) fail "the readout names the block it found: '$not_drawer'" ;;
+esac
+ctl command "setblock $NX $Y $Z minecraft:air" >/dev/null
+
+say "every carried drawer block and item exists (ten woods)"
+for wood in oak spruce birch jungle acacia dark_oak crimson warped mangrove cherry; do
+    id="functionalstorage:${wood}_1"
+    ctl command "setblock $((X - 3)) $Y $((Z - 2)) $id" >/dev/null || fail "cannot place $id"
+    ctl wait 2 >/dev/null
+    line=$(info $((X - 3)) $Y $((Z - 2)))
+    case "$line" in
+        "$id: 0/2048 empty") ;;
+        *) fail "$id reads '$line'" ;;
+    esac
+    reply=$(ctl give "$id" 1 2>&1) || fail "cannot give $id: $reply"
+    ctl wait 2 >/dev/null
+    ctl command "setblock $((X - 3)) $Y $((Z - 2)) minecraft:air" >/dev/null
+done
+ctl command "clear @s" >/dev/null
+echo "10/10 drawer blocks placed and read back, 10/10 items given"
+
+say "every carried drawer recipe crafts in a table (ten woods)"
+# Upstream's `<wood>_1`: eight planks of that wood around a chest, one drawer out. The tool asserts
+# the result, that it reaches the inventory, that the ingredients are consumed, and a wrong shape
+# crafts nothing.
+ctl command "setblock $((X - 3)) $Y $((Z + 2)) minecraft:crafting_table" >/dev/null
+ctl wait 4
+python3 "$PORT/tools/craft_check.py" "$SOCK" "$CTL" $((X - 3)) "$Y" $((Z + 2)) \
+    || fail "a carried drawer recipe did not craft"
+ctl close >/dev/null 2>&1 || true
+ctl command "setblock $((X - 3)) $Y $((Z + 2)) minecraft:air" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl command "gamemode creative @s" >/dev/null
+ctl command "tp @s $X.5 101 $((Z + 3)).5" >/dev/null
+ctl wait 6
+ctl look-at block "$X" "$Y" "$Z" "$facing" >/dev/null
+ctl wait 4
 
 say "a stack of stone: the drawer stores a whole stack at once"
 ctl command "clear @s" >/dev/null
@@ -263,9 +313,9 @@ amount=$(info_amount "$X" "$Y" "$Z")
 echo "stored: $amount"
 [ "$amount" = 68 ] || fail "the second click stored $amount, expected 68"
 
-say "left click shows the withdraw hint and takes nothing (pin block)"
-# Survival: a creative click would break the drawer outright, and this phase
-# must observe the hint, not a break.
+say "a left click on the front takes one item and cancels the dig"
+# Upstream `ItemControllableDrawerTile.onClicked`: one item (a whole stack while sneaking), front
+# panel only, once every three ticks; the dig never starts on the front panel.
 ctl command "gamemode survival" >/dev/null
 ctl wait 4 >/dev/null
 ctl command "clear @s" >/dev/null
@@ -274,16 +324,109 @@ ctl wait 4
 before_click=$(info_amount "$X" "$Y" "$Z")
 ctl mouse left click >/dev/null || fail "the left click failed"
 ctl wait 6 >/dev/null
-hint=$(action_bar)
 amount=$(info_amount "$X" "$Y" "$Z")
 one=$(count_item minecraft:stone)
-echo "action bar: '$hint'; stored: $before_click -> $amount, stone in the hand: $one"
-case "$hint" in
-    *"Open the drawer to withdraw"*) ;;
-    *) fail "the left click did not show the withdraw hint: '$hint'" ;;
+echo "left click: $before_click -> $amount, stone in the hand: $one, block: $(block_name "$X" "$Y" "$Z")"
+[ "$amount" = "$((before_click - 1))" ] || fail "the left click took $((before_click - amount)), expected 1"
+[ "$one" = 1 ] || fail "the left click gave $one stone, expected 1"
+[ "$(block_name "$X" "$Y" "$Z")" = "$DRAWER" ] || fail "the front left click dug the drawer"
+
+say "holding an axe on the front panel does not break it (the take cancels the dig)"
+# An axe would finish a wooden drawer well inside the 3 s window, so this only passes when the
+# click was cancelled and the take ran instead.
+ctl give minecraft:iron_axe 1 >/dev/null || fail "cannot give the axe"
+ctl wait 4
+ctl select minecraft:iron_axe >/dev/null || fail "cannot select the axe"
+ctl wait 4
+ctl look-at block "$X" "$Y" "$Z" "$facing" >/dev/null
+ctl wait 4
+echo "front dig: $(ctl break "$X" "$Y" "$Z" --timeout 3 2>&1 || true)"
+ctl wait 6 >/dev/null
+[ "$(block_name "$X" "$Y" "$Z")" = "$DRAWER" ] || fail "the front panel was dug out"
+ctl command "clear @s" >/dev/null
+ctl mouse left up >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+
+say "a second drawer: locked, a sneaking click takes the whole stack, the kind stays"
+# The 0.2.1 source-review fix made the lock a behaviour of the block entity; a locked drawer keeps
+# its kind at zero (upstream `BigInventoryHandler.extractItem`). This phase locks a drawer, takes
+# everything out with a sneak click and checks the drawer still holds its kind.
+X2=$((X + 2))
+ctl command "clear @s" >/dev/null
+ctl setblock "$X2" $((Y - 1)) "$Z" minecraft:stone >/dev/null
+ctl give functionalstorage:spruce_1 1 >/dev/null || fail "cannot give the second drawer"
+ctl wait 6
+ctl select functionalstorage:spruce_1 >/dev/null || true
+ctl wait 4
+ctl look-at block "$X2" $((Y - 1)) "$Z" up >/dev/null || fail "cannot aim at the second drawer's floor"
+ctl wait 4
+ctl place "$X2" "$Y" "$Z" --item functionalstorage:spruce_1 >/dev/null || fail "cannot place the second drawer"
+ctl wait 6
+[ "$(block_name "$X2" "$Y" "$Z")" = "functionalstorage:spruce_1" ] || fail "the second block is $(block_name "$X2" "$Y" "$Z")"
+facing2=$(block_facing "$X2" "$Y" "$Z")
+ctl look-at block "$X2" "$Y" "$Z" "$facing2" >/dev/null || fail "cannot aim at the second drawer's front"
+ctl wait 4
+# Ten stone in first (a fresh locked drawer refuses everything, as upstream's `isValid` does), then
+# lock it with a sneak right click and an empty hand (`toggleLocking`).
+ctl give minecraft:stone 10 >/dev/null
+ctl wait 6
+ctl select minecraft:stone >/dev/null || fail "cannot select stone"
+ctl wait 4
+ctl interact "$X2" "$Y" "$Z" "$facing2" >/dev/null || fail "cannot fill the second drawer"
+ctl wait 6
+before_sneak=$(info_amount "$X2" "$Y" "$Z")
+[ "$before_sneak" = 10 ] || fail "the second drawer holds $before_sneak, expected 10"
+ctl command "clear @s" >/dev/null
+ctl wait 4
+ctl key shift down >/dev/null || fail "cannot hold sneak"
+ctl wait 4
+ctl interact "$X2" "$Y" "$Z" "$facing2" >/dev/null || fail "the locking click failed"
+ctl key shift up >/dev/null
+ctl wait 6
+locked_line=$(info "$X2" "$Y" "$Z")
+echo "locked readout: $locked_line"
+case "$locked_line" in
+    *"minecraft:stone locked") ;;
+    *) fail "the sneak click did not lock the drawer: $locked_line" ;;
 esac
-[ "$amount" = "$before_click" ] || fail "the left click changed the drawer $before_click -> $amount"
-[ "$one" = 0 ] || fail "the left click gave $one stone, expected 0"
+# A sneaking left click takes the whole stack (upstream: the stack size).
+ctl look-at block "$X2" "$Y" "$Z" "$facing2" >/dev/null
+ctl wait 4
+ctl key shift down >/dev/null || fail "cannot hold sneak"
+ctl wait 4
+ctl mouse left click >/dev/null || fail "the sneaking left click failed"
+ctl key shift up >/dev/null
+ctl wait 8 >/dev/null
+after_sneak=$(info_amount "$X2" "$Y" "$Z")
+taken=$(count_item minecraft:stone)
+echo "sneaking left click: $before_sneak -> $after_sneak, stone in the hand: $taken"
+[ "$after_sneak" = 0 ] || fail "the sneaking click left $after_sneak in the drawer, expected 0"
+[ "$taken" = 10 ] || fail "the sneaking click gave $taken stone, expected a whole stack (10)"
+locked_line=$(info "$X2" "$Y" "$Z")
+echo "emptied locked readout: $locked_line"
+case "$locked_line" in
+    *"minecraft:stone locked") ;;
+    *) fail "the emptied locked drawer forgot its kind: $locked_line" ;;
+esac
+# Still locked: another kind is refused, its own kind returns.
+ctl give minecraft:dirt 5 >/dev/null
+ctl wait 6
+ctl select minecraft:dirt >/dev/null
+ctl wait 4
+ctl interact "$X2" "$Y" "$Z" "$facing2" >/dev/null || true
+ctl wait 6
+dirt=$(count_item minecraft:dirt)
+[ "$dirt" = 5 ] || fail "the locked emptied drawer took $((5 - dirt)) dirt"
+ctl command "clear @s" >/dev/null
+ctl give minecraft:stone 5 >/dev/null
+ctl wait 6
+ctl select minecraft:stone >/dev/null
+ctl wait 4
+ctl interact "$X2" "$Y" "$Z" "$facing2" >/dev/null || true
+ctl wait 6
+restocked=$(info_amount "$X2" "$Y" "$Z")
+echo "its own kind returns to the locked drawer: $restocked"
+[ "$restocked" = 5 ] || fail "the locked drawer took $restocked stone, expected 5"
 
 say "a hopper above fills the drawer"
 ctl command "clear @s" >/dev/null
@@ -358,13 +501,23 @@ ctl setblock $((X + 1)) "$Y" "$Z" minecraft:air >/dev/null
 ctl setblock "$X" $((Y - 1)) "$Z" minecraft:stone >/dev/null
 ctl setblock "$X" $((Y - 2)) "$Z" minecraft:air >/dev/null
 ctl setblock "$X" $((Y + 1)) "$Z" minecraft:air >/dev/null
+# The front panel takes instead of digging (the phase above), so the drawer is broken from the side:
+# the player steps west of it and aims at its west face.
+echo "drawer at $X $Y $Z; player before the move: $(ctl state | jq -c '.player.position')"
+# The vanilla command teleports the server's player; `ctl tp` sets the client's copy, which the
+# server can put back.
+ctl command "tp @s $((X - 1)).5 $Y $((Z)).5" >/dev/null
+ctl wait 8
+echo "break aim from: $(ctl state | jq -c '.player.position')"
+reply=$(ctl look-at block "$X" "$Y" "$Z" west 2>&1) || fail "cannot aim at the drawer's west face: $reply"
+ctl wait 4
 echo "break: $(ctl break "$X" "$Y" "$Z" 2>&1)"
 ctl wait 10 >/dev/null
 echo "block after break: $(ctl block "$X" "$Y" "$Z" | jq -c '{block,state}')"
 [ "$(block_name "$X" "$Y" "$Z")" = "minecraft:air" ] || fail "the drawer did not break"
 echo "items on the ground: $(ctl entities 8 | jq -c '[.entities[]? | select(.kind == "item")]')"
 # Walk onto the dropped item's block so the pickup lands in the inventory.
-ctl tp "$X.5" "$Y" "$((Z + 1)).5" >/dev/null
+ctl command "tp @s $((X + 1)).5 $Y $((Z)).5" >/dev/null
 ctl wait 30 >/dev/null
 items=$(count_item "$DRAWER")
 ground=$(dropped_item "$DRAWER")
@@ -374,7 +527,7 @@ echo "drawer items after the break: hand $items, ground $ground"
 ctl select "$DRAWER" >/dev/null 2>&1 || true
 # Back off first: at Z+1.5 the player's hitbox overlaps the target cell and the
 # placement is refused as "blocked by an entity".
-ctl tp "$X.5" "$Y" "$((Z + 3)).5" >/dev/null
+ctl command "tp @s $X.5 $Y $((Z + 3)).5" >/dev/null
 ctl wait 6 >/dev/null
 # The target is air after the break; aim at the floating support's south face
 # (the same support the first placement used), not at the empty cell.
@@ -393,8 +546,9 @@ echo "restored: $restored (was $before; the view spilled as the loose items abov
 
 say "the drawer's contents survive a relaunch"
 before_relaunch=$(info_amount "$X" "$Y" "$Z")
+locked_relaunch=$(info "$X2" "$Y" "$Z")
 [ "$before_relaunch" = "$restored" ] || fail "the readout changed before the relaunch: $restored -> $before_relaunch"
-echo "quit with $before_relaunch stored"
+echo "quit with $before_relaunch stored; the locked drawer reads '$locked_relaunch'"
 ctl quit >/dev/null 2>&1 || true
 sleep 5
 rm -f "$SOCK"
@@ -407,10 +561,13 @@ after_relaunch=$(info_amount "$X" "$Y" "$Z")
 echo "relaunch: stored $before_relaunch -> $after_relaunch at $(block_name "$X" "$Y" "$Z")"
 [ "$(block_name "$X" "$Y" "$Z")" = "$DRAWER" ] || fail "the drawer is gone after the relaunch"
 [ "$after_relaunch" = "$before_relaunch" ] || fail "the relaunch changed the drawer $before_relaunch -> $after_relaunch"
+locked_after=$(info "$X2" "$Y" "$Z")
+echo "relaunch: the locked drawer reads '$locked_after' (was '$locked_relaunch')"
+[ "$locked_after" = "$locked_relaunch" ] || fail "the relaunch changed the locked drawer: '$locked_relaunch' -> '$locked_after'"
 
 if [ "$NEGATIVE" = 1 ]; then
     say "NEGATIVE: assert the barrel's 64 limit on the drawer (must fail)"
     [ "$restored" = 0 ] || fail "the drawer stored $restored, not 0 (the check is alive)"
 fi
 
-echo "PASS: the drawer stores 100+, refuses other kinds, withdraws one through its menu (64 -> 63), its left click only shows the withdraw hint (the pin reverts a BE write there), hoppers move items, comparators read it, and a break keeps its contents"
+echo "PASS: the drawer stores 100+, refuses other kinds, withdraws one through its menu (64 -> 63), takes one per left click on its front (the dig refused) and a whole stack while sneaking (a locked drawer keeps its kind), hoppers move items, comparators read it, and a break keeps its contents"

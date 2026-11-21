@@ -1,18 +1,26 @@
 # Validation
 
-> **0.2.0 (SDK package) — current.** SDK nightly `0b14f8acfd97fa2c750e42795249dcc981178ca4`, mixins
-> `e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, 2026-11-18. `cargo test` **24 passed** (18 runtime, 6
-> support), clippy 0 warnings, `cargo fmt --check` clean, `cargo horizon-mod build` twice
-> **byte-identical** — `functionalstorage.hmod` **94,766 B**, sha256
-> `4ef7d482ae08a16bfb48270101861b4669ded2375e5657ff31dedff1c7a01996`, **97 entries**, `check` and
-> `fits` exit 0. **No 0.2.0 in-game run**: `horizon-launcher` is not installed here, so no launcher-built
-> game carries the package (`../_shared/evidence/functionalstorage/sdk-e2e-not-run.md`). The ladder for
-> this format is in `notes.md` → `## Migration to the SDK format`; the evidence is
-> `../_shared/evidence/functionalstorage/sdk-*`.
+> **0.2.2 (SDK package) — current.** Horizon `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` (Nightly
+> 2026-11-20) + mixins `e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, 26.3, launcher 0.2.92.
+> `cargo test` **34 passed** (20 runtime, 14 support) after a red run of **30 passed / 5 failed**;
+> clippy 0 warnings; `cargo fmt --check` clean; two `cargo horizon-mod build` runs **byte-identical** —
+> `functionalstorage.hmod` **99,246 B**, sha256
+> `244f5b8aed23b1fe98cf2bbd348bb011df470bcd2fdc32087df6718f767d1df0`, **97 entries**, no packed
+> `Cargo.lock`; `check` exit 0; `fits --build 0a875da` **`made for`** and `fits --build 0b14f8a`
+> **`fits`**; `verify-sdk-package.py` **1/1**. In game (`HORIZON_E2E_INSTANCE=functionalstorage-e2e`):
+> **`PASS` + `EXIT:0`**, control **`EXIT:1`**, `SELFTEST=1` **`EXIT:1`**,
+> `check-e2e-logs.py functionalstorage-e2e --strict` green. The slice: the faithful left-click take
+> (one item, a whole stack while sneaking, front panel only, a 3-tick window), the locked drawer's
+> kind kept at zero, and the ten carried blocks/items/recipes each exercised in game. Ladder,
+> transcripts and the coverage table: `notes.md` → `## Slice 2 — the left-click take (0.2.2)`.
 >
-> Everything below is the **0.1.0 history** (`.hnmod`, `horizon.py`): its toolchain is retired and its
-> commands no longer exist in this tree. Its e2e runs remain the behaviour's evidence for a
-> `src/runtime.rs` that the migration did not change.
+> **0.2.1** was `0b14f8a`/`e59da90`, 97,739 B, `9b7d86b9…5854`; **0.2.0** `0b14f8a`,
+> 94,766 B, `4ef7d482…1966` (no in-game run). Both are superseded by 0.2.2; a package built at an
+> older pin cannot re-run its e2e under the current wrapper.
+
+**Everything below is the 0.1.0 history** (`.hnmod`, `horizon.py`): its toolchain is retired and its
+commands no longer exist in this tree. Its e2e runs remain evidence for the behaviour the migration
+and this slice kept.
 
 Linux, Rust 1.97.0, pin **`1d63e0a5a37a7a708eb0b32b49bf0dfeb28ed8a9`**
 (horizon-mixins `5a64af938ec86b00d53d16a408aabc0038fb3e57`, schema 6),
@@ -45,15 +53,16 @@ Migration deltas at this pin are recorded in `notes.md`: `NativeScreen` gained
 `own_background` (set to `false`), the embedded tests moved behind `--lib`, and
 the e2e learned the barrel's reply namespace plus a relaunch-persistence phase.
 
-The left-click take is a **pin block**: the take's pure decrement is correct
-but the block entity write is reverted in every context tried
+The left-click take was a **0.1.0 pin block**: the take's pure decrement was
+correct but the block entity write was reverted in every context tried
 (`left_click_block`, the block entity tick, `player_tick`, `server_tick`,
 `level_tick_post`, `native_extract_item` from `server_tick`), while the same
-`mutate` from `right_click_block` persists. The port removes the left-click
-take (hint + menu withdrawal) to avoid duplication. Root cause and probes:
-`notes.md`. The e2e asserts the corrected behaviour and passes; the faithful
-left-click take stays blocked until the pin exposes an authoritative
-left-click/block-entity write, so the port is `ported-partial`.
+`mutate` from `right_click_block` persisted. **Resolved at the SDK pin
+(2026-11-21):** a block-entity write from `left_click_block` persists at
+`0a875da`, so 0.2.2 restores the faithful take (one item, a whole stack while
+sneaking, front panel only, a 3-tick window) and the e2e asserts it. The port is
+`ported` for the 1x1 drawers; the remaining scope is the other drawer families
+(`notes.md` → `## Coverage`).
 
 **Loot-table fix (2026-11-06, still in effect):** the 10 break loot tables were
 in the 1.20 `conditions: [{condition: ...}]` shape, which the 26.3 parser skips;

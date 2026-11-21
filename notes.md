@@ -620,15 +620,17 @@ and one free-fn/assoc entry each. The hook set it records: `register` (with
 
 ### Gaps after the migration
 
-1. **No 0.2.0 in-game run in this environment.** The e2e needs a game the launcher built with this
-   package (`horizon-launcher native-build`), and `horizon-launcher` is not installed here. The 0.1.0
-   runs (`evidence/functionalstorage/repin-e2e-1d63e0a.log`, `e2e-*.log`) remain the behaviour's
-   evidence for a `runtime.rs` that did not change and a glue layer whose calls were re-expressed, not
-   re-decided. `tools/e2e.sh` is updated and syntax-checked, and is the run to record before the port
-   is claimed `ported`.
-2. **The left-click take stays removed** (the 0.1.0 pin ruling): a block-entity write from
+1. **In-game evidence landed with 0.2.1.** 0.2.0 was never run in game (no launcher here); the 0.2.1
+   fixes came with the in-game leg: `ports/tools/launcher-game.sh run functionalstorage` → `PASS` +
+   `EXIT:0`, a control leg (`EXIT:1`) and a negative leg (`EXIT:1`), recorded in
+   `ports/_shared/evidence/functionalstorage-e2e/`. See `## Review fixes (2026-11-18)`.
+2. ~~**The left-click take stays removed** (the 0.1.0 pin ruling): a block-entity write from
    `left_click_block` was reverted at `1d63e0a`, so a take would duplicate. The click still shows
-   "Open the drawer to withdraw"; withdrawal is the menu's result slot.
+   "Open the drawer to withdraw"; withdrawal is the menu's result slot.~~
+   **Done in 0.2.2**: re-checked at the current pin, the block-entity write from `left_click_block`
+   persists; the faithful take (one item, a whole stack while sneaking, front panel only, a 3-tick
+   window) ships and is asserted in game — see `## Slice 2 — the left-click take (0.2.2)`. The 0.1.0
+   ruling named the retired engine, not this one.
 3. **The front shows the item without its count.** The SDK now has
    `BlockEntityDrawContext::text`, so a later slice can draw it (a new behaviour, not this migration).
 4. **No upgrades, no 1x2/2x2/compacting/fluid/ender/framed drawers, no controller, no armory cabinet,
@@ -644,6 +646,51 @@ and one free-fn/assoc entry each. The hook set it records: `register` (with
 
 None found in this migration; the 0.1.0 content defect (the loot tables' 1.20 `conditions` shape, which
 26.3 skipped) was already fixed in the carried data and is unchanged here.
+
+## Review fixes (2026-11-18)
+
+Review: `var/review/1243-functionalstorage.md` (source review of the 0.2.0 package; work done 2026-11-19).
+
+| Finding (`file:line`) | What a player could do | Fix | Test that pins it |
+|---|---|---|---|
+| `src/support.rs:511` — the drawer refreshes its logical amount only on the block-entity tick, so a right-click writeback (`:456`) can **restore** a withdrawal a menu/hopper already took, and a break (`:887`) can pack that withdrawal into the drop a second time | a hopper or menu takes from the view slot and a click/break in the same tick hands the same items out again (duplication) | `reconcile` is now the one rule every writer applies: `settle` reads the view slot and reconciles before `mutate` (clicks, lock, sweep) and before `stash_bulk` (break, explosion) work from the amount. A different kind in the slot is handed back instead of being overwritten | `a_writeback_after_a_withdraw_does_not_restore_the_withdrawn_count`, `a_matching_hopper_insert_is_accounted_for_before_the_writeback`, `a_break_packs_only_what_the_slot_still_shows` — all three fail with `reconcile` made a no-op |
+| `src/support.rs:259` — the chunk-update tag broadcast the **whole saved stack**, disclosing writable book pages and nested container contents to every viewer of the chunk | see any drawer's contents (book pages, shulker contents) without opening it | `render_item` sends only the fields the front model needs: the item id and `count: 1`. Components stay on the server | `the_client_update_carries_only_what_the_front_draws` — the counterfactual (send the saved stack) puts `minecraft:written_book_content` in the payload and the test fails |
+| `src/support.rs:1006` — the unrestricted `info` command named the block even when it was not a drawer, and read a drawer's item/amount at any loaded position | probe for hidden blocks and other players' machine contents anywhere loaded | the command is declared `Command::op(…, 2)` (game master and above) and a non-drawer gets one generic line, `Not a drawer.`, naming no block | `the_info_command_needs_an_operator` (level 2) plus the in-game phase "a block that is not a drawer gets one generic answer" — it fails on the old reply (`minecraft:barrel: not a drawer`) |
+
+### Defect the in-game leg caught: the click duplicated its stack
+
+The 0.2.0 package had never been run in game. Its first run failed at "the drawer stores a whole stack
+at once": the drawer stored 64 stone **and the hand kept the 64**. Cause, proved in game: the hand write
+was `let mut left = held; let _ = left.set_count(left.count() - inserted);` — and `ItemStack::set_count(0)`
+is **refused** at this pin, so an emptied hand kept the whole stack (the cmd's `clear @s` removed 64
+after the click). Fixed with `kept_count`/`remaining`: an emptied hand is `None`, never a zero-count
+copy, and the selected slot is written with `set_inventory_slot` (which also sends the client's sync).
+The sweep path used the same pattern and is fixed with it. Test: `an_emptied_hand_is_none_not_a_zero_count_copy`.
+
+Ladder (each step in one slot lease, `BUILD_LOCAL=1`, `CARGO_INCREMENTAL=0`):
+
+| Step | Result |
+|---|---|
+| `cargo test` | **30 passed**, 0 failed (29 lib incl. 8 support, +1 new) |
+| `cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` | exit 0 / exit 0, 0 warnings |
+| `cargo horizon-mod build` ×2 (`rm -f Cargo.lock` first) | `cmp` byte-identical, SHA-256 `9b7d86b9…5854` |
+| `cargo horizon-mod check functionalstorage.hmod` | exit 0 — `native-mod`, `native-1/0b14f8a…/e59da90…`, for 26.3 |
+| `cargo horizon-mod fits functionalstorage.hmod --build nightly` | exit 0 — `0b14f8a  made for` |
+| in-game (`launcher-game.sh run functionalstorage`) | **PASS + `EXIT:0`** — the whole 0.1.0 scenario (place, store, refuse, menu withdraw, hint, hoppers, comparator, break+place, relaunch) plus the generic-answer phase |
+| control (`GAME=$CONTROL_GAME`) | **FAIL + `EXIT:1`** — `cannot give functionalstorage:oak_1` |
+| negative (`NEGATIVE=1`) | **FAIL + `EXIT:1`** — `the drawer stored 164, not 0 (the check is alive)` |
+| `check-e2e-logs.py functionalstorage-e2e --strict` | `logs=3 ok=3 missing-exit=0 bad-exit=0` |
+
+| Item | Before | After |
+|---|---|---|
+| package | `functionalstorage.hmod` 94,766 B (0.2.0) | **`functionalstorage.hmod` 97,739 B `9b7d86b920c0d6d09fc292cce3296792150915f7830c3f08ef6b2672cd845854` (0.2.1)** |
+
+**Trap for the next session:** `launcher-game.sh run`/`build` reuse an existing installed build, and the
+wrapper cannot tell that a port's **sources** changed (it matches the manifest): after a code edit with
+no version bump the game keeps the old package and the e2e silently tests it. Delete the installed
+version that carries the mod (`~/.cache/horizon-e2e/root/data/horizon-launcher/versions/native-*`
+holding `horizon-native-mods/<mod>/`) before rebuilding, and confirm the export's `src/` holds the new
+code.
 
 ### Changelog for the resubmission (supersedes #831)
 
@@ -662,3 +709,231 @@ None found in this migration; the 0.1.0 content defect (the loot tables' 1.20 `c
 > upgrades or other drawer families).
 
 Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
+
+## Slice 2 — the left-click take (0.2.2, pin `0a875da`)
+
+### The gap, and why it is this slice
+
+`## Gaps after the migration`, item 2, said:
+
+> **The left-click take stays removed** (the 0.1.0 pin ruling): a block-entity write from
+> `left_click_block` was reverted at `1d63e0a`, so a take would duplicate. The click still shows
+> "Open the drawer to withdraw"; withdrawal is the menu's result slot.
+
+That ruling named the **retired `.hnmod` engine** at `1d63e0a`. `AGENTS.md` (*Slices*) requires a
+blocked item to be re-checked at every new pin, and by 0.2.1 the port already had in-game proof that
+this engine keeps block-entity writes from `right_click_block` (the insert), `on_block_placed_by`
+(the restore) and the block-entity tick (the reconcile) — so the old verdict was not this pin's
+verdict. This slice re-checks it, and the answer is yes: the take ships. It is the last behaviour the
+1x1 drawer was missing, so the port is no longer `ported-partial` **for this reason**.
+
+Tier unchanged: **content · machines** (a block-entity interaction of a machine block; no new tier
+surface).
+
+The slice was first written as `PLAN-0.2.2.md`, folded into this section and deleted.
+
+### The behaviour, read from upstream (`11edb40`, behaviour only)
+
+| Upstream | File | Rule |
+|---|---|---|
+| `PlayerInteractEvent.LeftClickBlock` handler | `FunctionalStorage.java:236-246` | a drawer whose **front panel** the ray hits: `onClicked`, then **cancel** — the panel is never dug; any other face digs as usual |
+| `ItemControllableDrawerTile.onClicked` | `:82-96` | server only; the ray's **face must be the front**; `removeTicks == 0` (set to 3 on the click, counted down by the tile's tick); `giveItemToPlayer(extractItem(slot, shift ? stackInSlot(slot).getMaxStackSize() : 1))` |
+| `BigInventoryHandler.extractItem` | `:79-100` | the last item leaves → the stack is cleared **only when unlocked** (`if (!isLocked()) bigStack.setStack(EMPTY)`); a locked drawer keeps its kind at 0 |
+| `ItemHandlerHelper.giveItemToPlayer` | NeoForge | `Inventory.add`: a matching stack with room first, then an empty slot, the rest thrown where the player stands |
+
+### What changed
+
+| File | Change |
+|---|---|
+| `src/runtime.rs` | `Drawer::extract` and `Drawer::sync_view` keep the kind when the drawer is `locked` and empties. **The file is no longer byte-identical to the retired 0.1.0 copy** (`604dd255…` now): this is a behaviour change of the slice, not a tidy — the old copy cleared the kind unconditionally on every path |
+| `src/support.rs` | `left_click` takes and gives; pure `take_count`, `take_ready`; `TAKE_COOLDOWN_TICKS = 3` and the cooldown map in `Core`; `write_drawer` keys the item on `drawer.item(0).is_some()` instead of `amount > 0`; `read_drawer` reads a kind standing at 0; `stash_bulk` packs a retained kind at 0 bulk so a break keeps it |
+| `src/lib.rs` | the `left_click_block` doc string (a take now, not a hint) |
+| `horizon-mod.toml`, `Cargo.toml` | `0.2.2`; the description names the take; `[native] horizon = 0a875da…` |
+| `tools/e2e.sh` | the take phase (one item, hand 1, block unchanged), the axe-on-the-front phase (no dig), the second drawer (lock, sneak take of the whole stack, the retained kind, dirt refused, stone back), the ten-wood block/item phase, the ten-recipe craft phase, the break from a side face, the locked drawer across the relaunch |
+| `tools/craft_check.py` | new: crafts all ten carried `<wood>_1` recipes in a crafting table and asserts the result, the inventory, that the ingredients are consumed, and that a stick in the centre crafts nothing |
+
+The take hands the stack over with `PlayerRef::give_stack`, which is the API's
+`ItemHandlerHelper.giveItemToPlayer` (`Inventory.add`, then a throw); a refused give (a dead or stale
+player) drops the take at the drawer through the existing `eject` instead of destroying it.
+
+### The red proof (before the fix)
+
+`ports/_shared/evidence/functionalstorage/slice2-test-red.log` — quoted verbatim:
+
+```
+failures:
+    runtime::tests::a_locked_drawer_keeps_its_kind_when_it_is_emptied
+    runtime::tests::a_locked_drawer_keeps_its_kind_when_the_view_empties_it
+    support::tests::a_taken_stack_joins_its_own_kind_before_an_empty_slot
+    support::tests::the_left_click_takes_one_or_a_whole_stack_while_sneaking
+    support::tests::the_left_click_window_is_three_ticks
+
+test result: FAILED. 30 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+with, per test:
+
+```
+thread 'runtime::tests::a_locked_drawer_keeps_its_kind_when_it_is_emptied' panicked at src/runtime.rs:336:9:
+assertion `left == right` failed: a locked drawer keeps its kind
+  left: None
+ right: Some("minecraft:stone")
+```
+```
+thread 'support::tests::the_left_click_takes_one_or_a_whole_stack_while_sneaking' panicked at src/support.rs:875:5:
+not yet implemented: the left-click take rule
+```
+
+(The give rule was first written as a local `give_plan` with its own red test —
+`a_taken_stack_joins_its_own_kind_before_an_empty_slot`, in the same log — then deleted when the SDK's
+`PlayerRef::give_stack` turned out to be exactly `ItemHandlerHelper.giveItemToPlayer`; the game then
+proved the give, which is the evidence that matters.)
+
+### Ladder (each step in one `build-slot.sh` lease, `BUILD_LOCAL=1`, `CARGO_INCREMENTAL=0`)
+
+Pin: Horizon `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` (Nightly 2026-11-20) + mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, 26.3.
+
+| Step | Result | Evidence |
+|---|---|---|
+| `cargo test` (before the fix) | **30 passed, 4 failed** | `slice2-test-red.log` |
+| `cargo test` (pin `0b14f8a`) | 34 passed, 0 failed | `slice2-test.log` |
+| `cargo test` (pin `0a875da`, current) | **34 passed, 0 failed** | `slice2-test-0a875da.log`, copied to `sdk-test.log` |
+| `cargo clippy --all-targets -- -D warnings` | exit 0, 0 warnings | `slice2-clippy-0a875da.log` |
+| `cargo fmt --check` (not `--all`) | clean | `slice2-fmt-0a875da.log` |
+| `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp` empty) | `slice2-build-0a875da-1.log`, `-2.log`, `slice2-build-0a875da-1.hmod` |
+| `cargo horizon-mod check functionalstorage.hmod` | exit 0 — `native-mod`, `native-1/0a875da…/e59da90…`, for 26.3 | `slice2-check-fits-0a875da.log` |
+| `cargo horizon-mod fits … --build 0a875da` | **`0a875da  made for`** (the pin: a tautology) | same log |
+| `cargo horizon-mod fits … --build 0b14f8a` | **`0b14f8a  fits`** (a different build: the real proof) | same log |
+| `verify-sdk-package.py functionalstorage` | **1/1** (package, runtime hash, no `Cargo.lock`, tests, clippy, check, fits, skills gate) | run output |
+
+Artifact: `functionalstorage.hmod`, **99,246 B**, sha256
+`244f5b8aed23b1fe98cf2bbd348bb011df470bcd2fdc32087df6718f767d1df0`, **97 entries**, no packed
+`Cargo.lock` (two builds byte-identical).
+
+### In-game leg (launcher 0.2.92, Nightly `0a875da`, `HORIZON_E2E_INSTANCE=functionalstorage-e2e`)
+
+`ports/_shared/evidence/functionalstorage-e2e/`:
+
+| Leg | Result |
+|---|---|
+| `e2e-launcher-0.2.2.log` | **`PASS` + `EXIT:0`** |
+| `e2e-launcher-0.2.2-control.log` (`GAME=$CONTROL_GAME`) | **`FAIL` + `EXIT:1`** — `cannot give functionalstorage:oak_1` |
+| `e2e-launcher-0.2.2-negative.log` (`SELFTEST=1`) | **`FAIL` + `EXIT:1`** — `the drawer stored 159, not 0 (the check is alive)` |
+| `check-e2e-logs.py functionalstorage-e2e --strict` | `logs=6  ok=6  missing-exit=0  bad-exit=0` |
+
+The lines that decide this slice (quoted from the passing log):
+
+```
+== a left click on the front takes one item and cancels the dig ==
+left click: 68 -> 67, stone in the hand: 1, block: functionalstorage:oak_1
+== holding an axe on the front panel does not break it (the take cancels the dig) ==
+front dig: {"block":"functionalstorage:oak_1[facing=south,open=false]","block_before":"…","picked_up":{"minecraft:stone":1},…}
+== a second drawer: locked, a sneaking click takes the whole stack, the kind stays ==
+locked readout: functionalstorage:spruce_1: 10/2048 minecraft:stone locked
+sneaking left click: 10 -> 0, stone in the hand: 10
+emptied locked readout: functionalstorage:spruce_1: 0/2048 minecraft:stone locked
+its own kind returns to the locked drawer: 5
+== every carried drawer block and item exists (ten woods) ==
+10/10 drawer blocks placed and read back, 10/10 items given
+== every carried drawer recipe crafts in a table (ten woods) ==
+oak: 8 minecraft:oak_planks + chest -> {"count": 1, "item": "functionalstorage:oak_1", "slot": 200}
+… (all ten woods) …
+8 oak planks + stick -> null
+all 10 drawer recipes craft, consume their ingredients, and refuse a wrong shape
+== breaking the drawer keeps its contents (survival, so it drops) ==
+restored: 160 (was 175; the view spilled as the loose items above)
+== the drawer's contents survive a relaunch ==
+relaunch: stored 160 -> 160 at functionalstorage:oak_1
+relaunch: the locked drawer reads 'functionalstorage:spruce_1: 5/2048 minecraft:stone locked' (was '…')
+PASS: … takes one per left click on its front (the dig refused) and a whole stack while sneaking (a locked drawer keeps its kind), …
+```
+
+**The headline for the campaign:** a block-entity write from `left_click_block` **persists** at this
+pin. The 0.1.0 duplication ruling does not reproduce; the take was re-enabled and the in-game leg
+asserts both halves (the item moves, the drawer's amount falls by exactly 1).
+
+### Coverage (parity rule, 2026-11-20)
+
+Every family the package carries is exercised through `horizon-ctl`; the jar's other families are
+declared `not ported` with the boundary. `python3 ports/tools/check-coverage.py functionalstorage`
+reads this table.
+
+| Family | Status | Evidence |
+|---|---|---|
+| `block_entity` | tested | e2e "empty drawer readout", "a stack of stone", the ten-wood phase, "the drawer's contents survive a relaunch" |
+| `data:license` | tested | `LICENSE` + `LICENSE-NOTICE.md` travel in the package; `verify-sdk-package.py` green (the licence gate) |
+| `functionalstorage:oak_1` | tested | e2e "place functionalstorage:oak_1", "a stack of stone", the ten-wood phase, `craft_check.py` oak, break+restore |
+| `functionalstorage:spruce_1` | tested | e2e "a second drawer: locked…", the ten-wood phase, `craft_check.py` spruce, break+restore |
+| `functionalstorage:birch_1` | tested | e2e the ten-wood phase, `craft_check.py` birch |
+| `functionalstorage:jungle_1` | tested | e2e the ten-wood phase, `craft_check.py` jungle |
+| `functionalstorage:acacia_1` | tested | e2e the ten-wood phase, `craft_check.py` acacia |
+| `functionalstorage:dark_oak_1` | tested | e2e the ten-wood phase, `craft_check.py` dark_oak |
+| `functionalstorage:crimson_1` | tested | e2e the ten-wood phase, `craft_check.py` crimson |
+| `functionalstorage:warped_1` | tested | e2e the ten-wood phase, `craft_check.py` warped |
+| `functionalstorage:mangrove_1` | tested | e2e the ten-wood phase, `craft_check.py` mangrove |
+| `functionalstorage:cherry_1` | tested | e2e the ten-wood phase, `craft_check.py` cherry |
+| `functionalstorage:blocks/oak_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (oak carries the same pool with its own id) |
+| `functionalstorage:blocks/spruce_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (spruce carries the same pool with its own id) |
+| `functionalstorage:blocks/birch_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (birch carries the same pool with its own id) |
+| `functionalstorage:blocks/jungle_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (jungle carries the same pool with its own id) |
+| `functionalstorage:blocks/acacia_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (acacia carries the same pool with its own id) |
+| `functionalstorage:blocks/dark_oak_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (dark_oak carries the same pool with its own id) |
+| `functionalstorage:blocks/crimson_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (crimson carries the same pool with its own id) |
+| `functionalstorage:blocks/warped_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (warped carries the same pool with its own id) |
+| `functionalstorage:blocks/mangrove_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (mangrove carries the same pool with its own id) |
+| `functionalstorage:blocks/cherry_1` | tested | the loot table the break phase asserts: the drawer drops itself with its contents (cherry carries the same pool with its own id) |
+| `block` | not ported | the jar's other drawer families (1x2, 2x2, compacting, fluid, ender, framed, controller, armory cabinet, upgrades) are outside this slice; only the ten 1x1 drawers are carried |
+| `item` | not ported | same boundary: the ten drawer items and their `functionalstorage:drawer` component only |
+| `loot_table` | not ported | same boundary; the ten carried loot tables are asserted by the break+restore phase |
+| `recipe:minecraft:crafting_shaped` | not ported | same boundary; the ten carried `<wood>_1` recipes are crafted in game by `tools/craft_check.py` |
+| `recipe:minecraft:crafting_shapeless` | not ported | upgrades are not carried (the obsidian upgrade recipe) |
+| `recipe:minecraft:smithing_transform` | not ported | upgrades are not carried (the netherite upgrade) |
+| `recipe:functionalstorage:custom_compacting` | not ported | the compacting drawer is not carried |
+| `recipe:functionalstorage:copy_components` | not ported | framed drawings are not carried |
+| `recipe:functionalstorage:framed_recipe` | not ported | framed drawers are not carried |
+| `tag:item` | not ported | the jar's drawer tags (`drawer`, `drawer_1x1`, `drawer_1x2`, `drawer_2x2`, `fluid_drawer`) are not carried; the carried block tag `minecraft:mineable/axe` ships in `data/minecraft/tags/block/mineable/axe.json` |
+| `command` | tested | `/functionalstorage info <pos>` — e2e "empty drawer readout" and "a block that is not a drawer gets one generic answer"; the parsed reply is asserted and the command is operator-only |
+
+The ten-wood phase (`setblock` + the parsed `info` reply + a `give` for each id) and
+`tools/craft_check.py` were added by this slice: before it, eight of the ten woods and every carried
+recipe were named nowhere, i.e. dead data by the parity rule.
+
+### Upstream defects fixed
+
+None in the mod this slice. The locked-kind rule *is* upstream's (`extractItem` clears the stack only
+when unlocked) and the port had simplified it away; the port now follows upstream, which is visible
+the moment a take empties a locked drawer:
+`emptied locked readout: functionalstorage:spruce_1: 0/2048 minecraft:stone locked`.
+
+### Deliberate deviations
+
+- **The front panel is never dug.** Upstream cancels the left click when the ray hits the front panel,
+  so a drawer is broken from any other face. The e2e proves both halves: an axe held on the front
+  leaves the drawer standing (and takes one item), a click on the west face breaks it.
+- **The 3-tick window is the port's tick counter** (`server_tick`'s end), as close to upstream's
+  `removeTicks` as the SDK exposes; the unit test pins the rule, the in-game leg pins the take.
+- **A locked *fresh* drawer refuses everything** (upstream's `isValid`: `if (isLocked() && fl.isEmpty())
+  return false`), so the e2e fills a drawer *before* locking it. A locked drawer that has been emptied
+  keeps its kind and takes its own kind back — that is the fixed behaviour above.
+
+### Traps this slice hit (the next port must know)
+
+1. **`ctl tp` moves the client's player; the server can put it back.** After a cancelled dig the tp
+   silently did nothing (the player stayed at the old spot) and `look-at` then failed with "no face of
+   block … is visible from here". Use `ctl command "tp @s x y z"` whenever a later step depends on the
+   position, and print the position when a `look-at` fails.
+2. **A face is only aimable from the side it faces.** `look-at block X Y Z up` failed from a player
+   whose eye was below the top plane; aim at a face you are actually outside of.
+3. **`launcher-game.sh build` inherits the instance's current build.** With the default `e2e`
+   instance still on `native-0b14f8a-…`, the launcher refused the new package with *"functionalstorage's
+   package was made by an older tool and doesn't say what it uses, so it works on the Nov 20 update
+   only"* — the message is about the **instance**, not the package. A per-mod instance
+   (`HORIZON_E2E_INSTANCE=functionalstorage-e2e`) builds cleanly; the wrapper's `run` then exports to
+   `~/.cache/horizon-e2e/0a875da/functionalstorage`.
+4. **The launcher has one build lock.** A second `native-build` while another agent builds answers
+   `A native build or cache cleanup is running`; wait for the neighbour's build, do not retry in a loop.
+5. **`ItemStack::set_count(0)` is still refused**, so the take hands over a stack whose count is set
+   from the drawer, never a decremented copy.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
